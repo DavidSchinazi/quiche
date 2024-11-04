@@ -43,6 +43,7 @@
 #include "quiche/common/platform/api/quiche_googleurl.h"
 #include "quiche/common/platform/api/quiche_logging.h"
 #include "quiche/common/platform/api/quiche_system_event_loop.h"
+#include "quiche/common/wire_serialization.h"
 
 DEFINE_QUICHE_COMMAND_LINE_FLAG(
     bool, disable_certificate_verification, false,
@@ -91,6 +92,233 @@ namespace {
 using ::quiche::AddressAssignCapsule;
 using ::quiche::AddressRequestCapsule;
 using ::quiche::RouteAdvertisementCapsule;
+
+class MasqueConnectUdpBindSession
+    : public MasqueClientSession::EncapsulatedClientSession {
+ public:
+  MasqueConnectUdpBindSession(MasqueClientSession* session)
+      : session_(session) {
+    session_->InitBindState(quiche::CompressionAssignCapsule::kNilAddress,
+                            this);
+    createOpenContext();
+  }
+
+  MasqueConnectUdpBindSession(std::vector<std::string> urls,
+                              MasqueClientSession* session)
+      : session_(session) {
+    session_->InitBindState(quiche::CompressionAssignCapsule::kNilAddress,
+                            this);
+    for (auto& url : urls) {
+      createCompressedContext(url);
+    }
+  }
+
+  void ProcessPacket(absl::string_view packet,
+                     QuicSocketAddress /*target_server_address*/) override {
+    QUIC_LOG(INFO) << "Received packet of length " << packet.length();
+    QuicDataReader reader(packet);
+    uint64_t context_id;
+    QuicSocketAddress target_address;
+    if (!reader.ReadVarInt62(&context_id)) {
+      QUIC_DLOG(ERROR) << "Failed to read context ID";
+      return;
+    }
+    if (!bind_context_ip_map_.contains(context_id)) {
+      // non existent context id
+      QUIC_DLOG(ERROR) << "Non existent context id" << context_id;
+      // drop the packet
+      return;
+    }
+    if (bind_context_ip_map_[context_id] ==
+        quiche::CompressionAssignCapsule::kNilAddress) {
+      // parse IP and port
+      uint8_t ip_version;
+      if (!reader.ReadUInt8(&ip_version)) {
+        QUIC_DLOG(ERROR) << "Failed to read IP version";
+        return;
+      }
+      auto address_size = ip_version == 4
+                              ? quiche::QuicheIpAddress::kIPv4AddressSize
+                              : quiche::QuicheIpAddress::kIPv6AddressSize;
+      absl::string_view ip_address_bytes;
+      if (!reader.ReadStringPiece(&ip_address_bytes, address_size)) {
+        QUIC_DLOG(ERROR) << "Failed to read IP address";
+        return;
+      }
+      quiche::QuicheIpAddress ip_address;
+      if (!ip_address.FromPackedString(ip_address_bytes.data(), address_size)) {
+        QUIC_DLOG(ERROR) << "Failed to parse IP address";
+        return;
+      }
+      uint16_t port;
+      if (!reader.ReadUInt16(&port)) {
+        QUIC_DLOG(ERROR) << "Failed to read port";
+        return;
+      }
+      target_address = QuicSocketAddress(ip_address, port);
+    } else {
+      target_address = bind_context_ip_map_[context_id];
+    }
+    auto remaining_packet = reader.ReadRemainingPayload();
+    OnRecvUdpPacket(remaining_packet, target_address, context_id);
+  }
+  void CloseConnection(
+      QuicErrorCode error, const std::string& details,
+      ConnectionCloseBehavior /*connection_close_behavior*/) override {
+    QUIC_LOG(ERROR) << "Closing connection" << details << " " << error;
+  }
+
+  bool OnCompressionAssignCapsule(
+      const quiche::CompressionAssignCapsule& capsule) override {
+    QUIC_DLOG(INFO) << "CompressionAssignCapsule received: "
+                    << capsule.ToString();
+    if (!bind_context_ip_map_.contains(capsule.context_id)) {
+      // server is asking to create a new context
+      if (capsule.ip_address_port ==
+          quiche::CompressionAssignCapsule::kNilAddress) {
+        // server is not allowed to create open context
+        QUIC_DLOG(ERROR) << "Server is not allowed to create open context";
+        return false;
+      } else {
+        // compressed context requested by server
+        if (capsule.context_id % 2 == 0) {
+          // even contexts are reserved for open contexts
+          QUIC_DLOG(ERROR) << "Server is not allowed to create even contexts";
+          return false;
+        }
+        bind_context_ip_map_[capsule.context_id] = capsule.ip_address_port;
+        // send acknowledgement
+
+        quiche::Capsule to_send = quiche::Capsule::CompressionAssign();
+        to_send.compression_assign_capsule() = capsule;
+        session_->SendBindCapsule(to_send, this);
+        return true;
+      }
+    } else if (bind_context_ip_map_[capsule.context_id] !=
+               capsule.ip_address_port) {
+      // context already exists but the target address is different
+      QUIC_DLOG(ERROR)
+          << "Context already exists with different target address";
+      QUIC_DLOG(ERROR) << bind_context_ip_map_[capsule.context_id] << " and "
+                       << capsule.ip_address_port;
+      return false;
+    } else {
+      // this is an ack of client's request, ignore it
+      return true;
+    }
+
+    return true;
+  }
+
+  bool OnCompressionCloseCapsule(
+      const quiche::CompressionCloseCapsule& capsule) override {
+    QUIC_DLOG(INFO) << "CompressionCloseCapsule received: "
+                    << capsule.ToString();
+    // if we have this context id in the map, we can close it and send ack.
+    if (bind_context_ip_map_.contains(capsule.context_id)) {
+      closeContext(capsule.context_id);
+    }
+    return true;
+  }
+
+ private:
+  bool sendBindPacket(absl::string_view packet,
+                      const QuicSocketAddress& target_address, int context_id) {
+    quiche::WireVarInt62 context_id_varint(context_id);
+    size_t total_size = context_id_varint.GetLengthOnWire() + packet.size();
+    std::string payload;
+    if (bind_context_ip_map_[context_id] == target_address) {
+      // no need to append target info, compress it
+      payload.resize(total_size);
+      QuicDataWriter writer(total_size, payload.data());
+      context_id_varint.SerializeIntoWriter(writer);
+      writer.WriteStringPiece(packet);
+    } else {
+      // append target info
+      total_size += (sizeof(uint8_t)  // ip version
+                     + target_address.host().ToPackedString().size()  // ip addr
+                     + sizeof(uint16_t));                             // port
+      payload.resize(total_size);
+      QuicDataWriter writer(total_size, payload.data());
+      context_id_varint.SerializeIntoWriter(writer);
+      writer.WriteUInt8(
+          target_address.host().AddressFamilyToInt() == AF_INET ? 4 : 6);
+      writer.WriteStringPiece(target_address.host().ToPackedString());
+      writer.WriteUInt16(target_address.port());
+      writer.WriteStringPiece(packet);
+    }
+    QUIC_DLOG(INFO) << "Sending bind packet: " << payload << " of length "
+                    << payload.length() << " to " << target_address;
+
+    session_->SendPacket(payload, quiche::CompressionAssignCapsule::kNilAddress,
+                         this);
+    return true;
+  }
+
+  int createCompressedContext(absl::string_view address) {
+    // GetOrCreateConnectUdpClientState(
+    //     quiche::CompressionAssignCapsule::kNilAddress, this);
+
+    std::vector<std::string> ip_port =
+        absl::StrSplit(address, absl::MaxSplits(':', 1));
+    QuicIpAddress ip_address;
+    ip_address.FromString(ip_port[0]);
+    int port = std::stoi(ip_port[1]);
+    QuicSocketAddress target_address(ip_address, port);
+    bind_context_ip_map_[context_id_counter_] = target_address;
+    quiche::Capsule capsule = quiche::Capsule::CompressionAssign();
+    capsule.compression_assign_capsule().context_id = context_id_counter_;
+    capsule.compression_assign_capsule().ip_address_port = target_address;
+
+    session_->SendBindCapsule(capsule, this);
+    // TODO(abhisinghx): verify acks before using it
+    context_id_counter_ += 2;
+    return context_id_counter_ - 2;
+  }
+
+  int createOpenContext() {
+    bind_context_ip_map_[context_id_counter_] =
+        quiche::CompressionAssignCapsule::kNilAddress;
+    quiche::Capsule capsule = quiche::Capsule::CompressionAssign();
+    capsule.compression_assign_capsule().context_id = context_id_counter_;
+    capsule.compression_assign_capsule().ip_address_port =
+        quiche::CompressionAssignCapsule::kNilAddress;
+    QUIC_DLOG(INFO) << "Requesting open context " << context_id_counter_;
+    session_->SendBindCapsule(capsule, this);
+    // TODO(abhisinghx): verify ack capsule before using it
+    context_id_counter_ += 2;
+    return context_id_counter_ - 2;
+  }
+
+  void closeContext(int context_id) {
+    bind_context_ip_map_.erase(context_id);
+    quiche::Capsule capsule = quiche::Capsule::CompressionClose();
+    capsule.compression_close_capsule().context_id = context_id;
+    QUIC_DLOG(INFO) << "Closing context " << context_id;
+    session_->SendBindCapsule(capsule, this);
+  }
+
+  QuicSocketAddress getProxyPublicAddress() {
+    // todo: implement
+    return QuicSocketAddress();
+  }
+
+  void OnRecvUdpPacket(absl::string_view packet,
+                       const QuicSocketAddress& target_address,
+                       int context_id) {
+    QUIC_LOG(INFO) << "Received packet of length " << packet.length()
+                   << " value: " << packet;
+    // echo back the packet to the client.
+    if (!sendBindPacket(packet, target_address, context_id)) {
+      QUIC_LOG(ERROR)
+          << "Unable to echo packet back on context to the sending target";
+    };
+  }
+
+  MasqueClientSession* session_;
+  int context_id_counter_ = 0;
+  absl::flat_hash_map<int, QuicSocketAddress> bind_context_ip_map_ = {};
+};
 
 class MasqueTunSession : public MasqueClientSession::EncapsulatedIpSession,
                          public QuicSocketEventListener {
@@ -356,6 +584,10 @@ int RunMasqueClient(int argc, char* argv[]) {
     } else if (mode_string == "connectethernet" ||
                mode_string == "connect-ethernet") {
       masque_mode = MasqueMode::kConnectEthernet;
+    } else if (mode_string == "connectudpbind" ||
+               mode_string == "connect-udp-bind") {
+      masque_mode = MasqueMode::kConnectUdpBind;
+      QUIC_LOG(INFO) << "Using connect-udp-bind mode";
     } else {
       QUIC_LOG(ERROR) << "Invalid masque_mode \"" << mode_string << "\"";
       return 1;
@@ -412,6 +644,9 @@ int RunMasqueClient(int argc, char* argv[]) {
       masque_client =
           MasqueClient::Create(uri_template, masque_mode, event_loop.get(),
                                std::move(proof_verifier));
+    } else if (masque_mode == MasqueMode::kConnectUdpBind) {
+      QUIC_LOG(FATAL)
+          << "multiple nested clients not supported for connect-udp-bind";
     } else {
       masque_client = tools::CreateAndConnectMasqueEncapsulatedClient(
           masque_clients.back().get(), masque_mode, event_loop.get(),
@@ -441,6 +676,26 @@ int RunMasqueClient(int argc, char* argv[]) {
       std::move(masque_clients.back());
   masque_clients.pop_back();
 
+  if (masque_mode == MasqueMode::kConnectUdpBind) {
+    // create connect-udp-bind handler.
+    urls.erase(urls.begin());
+    // if no IP:ports are present, we create a single open context.
+    // else we create compressed contexts per IP:port.
+    auto handler = urls.empty()
+                       ? new MasqueConnectUdpBindSession(
+                             masque_client->masque_client_session())
+                       : new MasqueConnectUdpBindSession(
+                             urls, masque_client->masque_client_session());
+    (void)handler;
+
+    QUIC_LOG(INFO) << "Starting event loop for bind";
+    // run event loop.
+    while (true) {
+      event_loop->RunEventLoopOnce(QuicTime::Delta::FromMilliseconds(50));
+    }
+    QUICHE_NOTREACHED();
+    return 0;
+  }
   if (bring_up_tun) {
     QUIC_LOG(INFO) << "Bringing up tun";
     MasqueTunSession tun_session(event_loop.get(),

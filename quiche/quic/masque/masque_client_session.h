@@ -67,6 +67,12 @@ class QUIC_NO_EXPORT MasqueClientSession : public QuicSpdyClientSession,
     virtual void CloseConnection(
         QuicErrorCode error, const std::string& details,
         ConnectionCloseBehavior connection_close_behavior) = 0;
+
+    virtual bool OnCompressionAssignCapsule(
+        const quiche::CompressionAssignCapsule& capsule) = 0;
+
+    virtual bool OnCompressionCloseCapsule(
+        const quiche::CompressionCloseCapsule& capsule) = 0;
   };
 
   // Interface meant to be implemented by client sessions encapsulated inside
@@ -140,6 +146,24 @@ class QUIC_NO_EXPORT MasqueClientSession : public QuicSpdyClientSession,
                   const QuicSocketAddress& target_server_address,
                   EncapsulatedClientSession* encapsulated_client_session);
 
+  // Initialise state without needing to send payloads
+  void InitBindState(const QuicSocketAddress& target_server_address,
+                     EncapsulatedClientSession* encapsulated_client_session) {
+    const ConnectUdpClientState* connect_udp = GetOrCreateConnectUdpClientState(
+        target_server_address, encapsulated_client_session);
+    if (connect_udp == nullptr) {
+      QUIC_DLOG(ERROR) << "Failed to create CONNECT-UDP request";
+      return;
+    }
+  }
+
+  // Send Capsule for CONNECT-UDP Bind.
+  void SendBindCapsule(
+      const quiche::Capsule& capsule,
+      EncapsulatedClientSession* /*encapsulated_client_session*/) {
+    bind_state_->stream()->WriteCapsule(capsule);
+  }
+
   // Send encapsulated IP packet. |packet| contains the IP header and payload.
   void SendIpPacket(absl::string_view packet,
                     EncapsulatedIpSession* encapsulated_ip_session);
@@ -192,7 +216,8 @@ class QUIC_NO_EXPORT MasqueClientSession : public QuicSpdyClientSession,
  private:
   // State that the MasqueClientSession keeps for each CONNECT-UDP request.
   class QUIC_NO_EXPORT ConnectUdpClientState
-      : public QuicSpdyStream::Http3DatagramVisitor {
+      : public QuicSpdyStream::Http3DatagramVisitor,
+        public QuicSpdyStream::ConnectUDPBindVisitor {
    public:
     // |stream| and |encapsulated_client_session| must be valid for the lifetime
     // of the ConnectUdpClientState.
@@ -203,6 +228,8 @@ class QUIC_NO_EXPORT MasqueClientSession : public QuicSpdyClientSession,
         const QuicSocketAddress& target_server_address);
 
     ~ConnectUdpClientState();
+
+    void setIsBind(bool is_bind) { is_bind_ = is_bind; }
 
     // Disallow copy but allow move.
     ConnectUdpClientState(const ConnectUdpClientState&) = delete;
@@ -224,11 +251,23 @@ class QUIC_NO_EXPORT MasqueClientSession : public QuicSpdyClientSession,
     void OnUnknownCapsule(QuicStreamId /*stream_id*/,
                           const quiche::UnknownCapsule& /*capsule*/) override {}
 
+    // From QuicSpdyStream::ConnectUDPBindVisitor.
+    bool OnCompressionAssignCapsule(
+        const quiche::CompressionAssignCapsule& capsule) override {
+      return encapsulated_client_session_->OnCompressionAssignCapsule(capsule);
+    }
+    bool OnCompressionCloseCapsule(
+        const quiche::CompressionCloseCapsule& capsule) override {
+      return encapsulated_client_session_->OnCompressionCloseCapsule(capsule);
+    }
+
    private:
     QuicSpdyClientStream* stream_;                            // Unowned.
     EncapsulatedClientSession* encapsulated_client_session_;  // Unowned.
     MasqueClientSession* masque_session_;                     // Unowned.
     QuicSocketAddress target_server_address_;
+
+    bool is_bind_ = false;
   };
 
   // State that the MasqueClientSession keeps for each CONNECT-IP request.
@@ -332,6 +371,7 @@ class QUIC_NO_EXPORT MasqueClientSession : public QuicSpdyClientSession,
   void AddAdditionalHeaders(quiche::HttpHeaderBlock& headers,
                             const QuicUrl& url);
 
+  bool isBind() const { return masque_mode_ == MasqueMode::kConnectUdpBind; }
   MasqueMode masque_mode_;
   std::string uri_template_;
   std::string additional_headers_;
@@ -345,6 +385,9 @@ class QUIC_NO_EXPORT MasqueClientSession : public QuicSpdyClientSession,
   // hostnames.
   absl::flat_hash_map<std::string, std::string> fake_addresses_;
   Owner* owner_ = nullptr;  // Unowned;
+
+  // State that the MasqueClientSession keeps for each CONNECT-UDP-BIND request.
+  std::unique_ptr<ConnectUdpClientState> bind_state_ = nullptr;
 };
 
 }  // namespace quic

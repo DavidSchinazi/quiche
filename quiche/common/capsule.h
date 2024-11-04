@@ -5,6 +5,8 @@
 #ifndef QUICHE_COMMON_CAPSULE_H_
 #define QUICHE_COMMON_CAPSULE_H_
 
+#include <stdbool.h>
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -13,6 +15,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/variant.h"
+#include "quiche/quic/platform/api/quic_socket_address.h"
 #include "quiche/common/platform/api/quiche_export.h"
 #include "quiche/common/platform/api/quiche_logging.h"
 #include "quiche/common/quiche_buffer_allocator.h"
@@ -36,6 +39,10 @@ enum class CapsuleType : uint64_t {
   ADDRESS_ASSIGN = 0x1ECA6A00,
   ADDRESS_REQUEST = 0x1ECA6A01,
   ROUTE_ADVERTISEMENT = 0x1ECA6A02,
+
+  // draft-ietf-masque-connect-udp-listen-04
+  COMPRESSION_ASSIGN = 0x1C0FE323,
+  COMPRESSION_CLOSE = 0x1C0FE324,
 
   // <https://ietf-wg-webtrans.github.io/draft-webtransport-http2/draft-ietf-webtrans-http2.html#name-webtransport-capsules>
   WT_RESET_STREAM = 0x190b4d39,
@@ -141,6 +148,43 @@ struct QUICHE_EXPORT AddressRequestCapsule {
   std::string ToString() const;
   CapsuleType capsule_type() const { return CapsuleType::ADDRESS_REQUEST; }
 };
+
+// TODOD(abhisinghx): Implement these capsules
+struct QUICHE_EXPORT CompressionAssignCapsule {
+  static quic::QuicSocketAddress kNilAddress;
+  uint64_t context_id;
+  quic::QuicSocketAddress ip_address_port = kNilAddress;
+
+  std::string IpAddress() const {
+    if (ip_address_port == kNilAddress) {
+      return "";
+    }
+    return ip_address_port.host().ToPackedString();
+  }
+  uint16_t Port() const {
+    if (ip_address_port == kNilAddress) {
+      return UINT16_MAX;
+    }
+    return ip_address_port.port();
+  }
+
+  uint8_t IpVersion() const {
+    if (ip_address_port == kNilAddress) {
+      return 0;
+    }
+    return ip_address_port.host().IsIPv4() ? 4 : 6;
+  }
+  bool operator==(const CompressionAssignCapsule& other) const;
+  std::string ToString() const;
+  CapsuleType capsule_type() const { return CapsuleType::COMPRESSION_ASSIGN; }
+};
+struct QUICHE_EXPORT CompressionCloseCapsule {
+  uint64_t context_id;
+  bool operator==(const CompressionCloseCapsule& other) const;
+  std::string ToString() const;
+  CapsuleType capsule_type() const { return CapsuleType::COMPRESSION_CLOSE; }
+};
+
 struct QUICHE_EXPORT RouteAdvertisementCapsule {
   std::vector<IpAddressRange> ip_address_ranges;
   bool operator==(const RouteAdvertisementCapsule& other) const;
@@ -226,6 +270,8 @@ class QUICHE_EXPORT Capsule {
   static Capsule AddressRequest();
   static Capsule AddressAssign();
   static Capsule RouteAdvertisement();
+  static Capsule CompressionAssign();
+  static Capsule CompressionClose();
   static Capsule Unknown(
       uint64_t capsule_type,
       absl::string_view unknown_capsule_data = absl::string_view());
@@ -288,6 +334,18 @@ class QUICHE_EXPORT Capsule {
   const RouteAdvertisementCapsule& route_advertisement_capsule() const {
     return absl::get<RouteAdvertisementCapsule>(capsule_);
   }
+  CompressionAssignCapsule& compression_assign_capsule() {
+    return absl::get<CompressionAssignCapsule>(capsule_);
+  }
+  const CompressionAssignCapsule& compression_assign_capsule() const {
+    return absl::get<CompressionAssignCapsule>(capsule_);
+  }
+  CompressionCloseCapsule& compression_close_capsule() {
+    return absl::get<CompressionCloseCapsule>(capsule_);
+  }
+  const CompressionCloseCapsule& compression_close_capsule() const {
+    return absl::get<CompressionCloseCapsule>(capsule_);
+  }
   WebTransportStreamDataCapsule& web_transport_stream_data() {
     return absl::get<WebTransportStreamDataCapsule>(capsule_);
   }
@@ -334,7 +392,8 @@ class QUICHE_EXPORT Capsule {
                 AddressAssignCapsule, RouteAdvertisementCapsule,
                 WebTransportStreamDataCapsule, WebTransportResetStreamCapsule,
                 WebTransportStopSendingCapsule, WebTransportMaxStreamsCapsule,
-                WebTransportMaxStreamDataCapsule, UnknownCapsule>
+                WebTransportMaxStreamDataCapsule, UnknownCapsule,
+                CompressionAssignCapsule, CompressionCloseCapsule>
       capsule_;
 };
 

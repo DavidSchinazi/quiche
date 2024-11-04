@@ -10,6 +10,8 @@
 #include <netinet/ip_icmp.h>
 #include <netinet/udp.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -24,6 +26,7 @@
 #include "absl/strings/escaping.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
 #include "openssl/curve25519.h"
@@ -38,6 +41,7 @@
 #include "quiche/quic/core/quic_constants.h"
 #include "quiche/quic/core/quic_crypto_server_stream_base.h"
 #include "quiche/quic/core/quic_data_reader.h"
+#include "quiche/quic/core/quic_data_writer.h"
 #include "quiche/quic/core/quic_session.h"
 #include "quiche/quic/core/quic_time.h"
 #include "quiche/quic/core/quic_types.h"
@@ -394,6 +398,19 @@ MasqueServerSession::MaybeCheckConcealedAuth(
 std::unique_ptr<QuicBackendResponse> MasqueServerSession::HandleMasqueRequest(
     const quiche::HttpHeaderBlock& request_headers,
     QuicSimpleServerBackend::RequestHandler* request_handler) {
+  auto connect_udp_bind_pair = request_headers.find("connect-udp-bind");
+  bool has_bind_header = false;
+  if (connect_udp_bind_pair != request_headers.end()) {
+    if (connect_udp_bind_pair->second != "?1") {
+      QUIC_DLOG(ERROR) << "Bad value for connect-udp-bind header: "
+                       << connect_udp_bind_pair->second;
+      return CreateBackendErrorResponse(
+          "400", absl::StrCat("Bad value for connect-udp-bind header:",
+                              connect_udp_bind_pair->second));
+    }
+    has_bind_header = true;
+  }
+
   // Authority.
   auto authority_pair = request_headers.find(":authority");
   if (authority_pair == request_headers.end()) {
@@ -535,6 +552,7 @@ std::unique_ptr<QuicBackendResponse> MasqueServerSession::HandleMasqueRequest(
 
     return response;
   }
+
   // Extract target host and port from path using default template.
   std::vector<absl::string_view> path_split = absl::StrSplit(path, '/');
   if (path_split.size() != 7 || !path_split[0].empty() ||
@@ -555,45 +573,63 @@ std::unique_ptr<QuicBackendResponse> MasqueServerSession::HandleMasqueRequest(
     return CreateBackendErrorResponse("500", "Failed to decode port");
   }
 
-  // Perform DNS resolution.
-  addrinfo hint = {};
-  hint.ai_protocol = IPPROTO_UDP;
+  QuicSocketAddress target_server_address;
+  if (has_bind_header && host == "*" && port == "*") {
+    // This is a valid connect-udp-bind request
+    target_server_address = quiche::CompressionAssignCapsule::kNilAddress;
+  } else if (has_bind_header) {
+    QUIC_DLOG(ERROR)
+        << "Bad value for target when connect-udp-bind is present: host:"
+        << host.value() << " port: " << port.value();
+    return CreateBackendErrorResponse(
+        "400",
+        absl::StrCat(
+            "Bad value for target when connect-udp-bind is present: host:",
+            host.value(), " port: ", port.value()));
+  } else if (host == "*" || port == "*") {
+    // Error
+    QUIC_DLOG(ERROR)
+        << "Bad value for target when connect-udp-bind is absent: host:"
+        << host.value() << " port: " << port.value();
+    return CreateBackendErrorResponse(
+        "400",
+        absl::StrCat(
+            "Bad value for target when connect-udp-bind is absent: host:",
+            host.value(), " port: ", port.value()));
 
-  addrinfo* info_list = nullptr;
-  int result = getaddrinfo(host->c_str(), port->c_str(), &hint, &info_list);
-  if (result != 0 || info_list == nullptr) {
-    QUIC_DLOG(ERROR) << "Failed to resolve " << authority << ": "
-                     << gai_strerror(result);
-    return CreateBackendErrorResponse("500", "DNS resolution failed");
+  } else {
+    // normal connect udp
+
+    // Perform DNS resolution.
+    addrinfo hint = {};
+    hint.ai_protocol = IPPROTO_UDP;
+
+    addrinfo* info_list = nullptr;
+    int result = getaddrinfo(host->c_str(), port->c_str(), &hint, &info_list);
+    if (result != 0 || info_list == nullptr) {
+      QUIC_DLOG(ERROR) << "Failed to resolve " << authority << ": "
+                       << gai_strerror(result);
+      return CreateBackendErrorResponse("500", "DNS resolution failed");
+    }
+
+    std::unique_ptr<addrinfo, void (*)(addrinfo*)> info_list_owned(
+        info_list, freeaddrinfo);
+    target_server_address =
+        QuicSocketAddress(info_list->ai_addr, info_list->ai_addrlen);
   }
 
-  std::unique_ptr<addrinfo, void (*)(addrinfo*)> info_list_owned(info_list,
-                                                                 freeaddrinfo);
-  QuicSocketAddress target_server_address(info_list->ai_addr,
-                                          info_list->ai_addrlen);
   QUIC_DLOG(INFO) << "Got CONNECT_UDP request on stream ID "
                   << request_handler->stream_id() << " target_server_address=\""
                   << target_server_address << "\"";
-
-  FdWrapper fd_wrapper(target_server_address.host().AddressFamilyToInt());
-  if (fd_wrapper.fd() == kQuicInvalidSocketFd) {
-    QUIC_DLOG(ERROR) << "Socket creation failed";
-    return CreateBackendErrorResponse("500", "Socket creation failed");
+  std::vector<std::string> configured_addresses;
+  std::vector<int> ip_versions;
+  if (has_bind_header) {
+    ip_versions = {4, 6};
+  } else {
+    ip_versions.push_back(
+        target_server_address.host().AddressFamilyToInt() == AF_INET ? 4 : 6);
   }
-  QuicSocketAddress empty_address(QuicIpAddress::Any6(), 0);
-  if (target_server_address.host().IsIPv4()) {
-    empty_address = QuicSocketAddress(QuicIpAddress::Any4(), 0);
-  }
-  QuicUdpSocketApi socket_api;
-  if (!socket_api.Bind(fd_wrapper.fd(), empty_address)) {
-    QUIC_DLOG(ERROR) << "Socket bind failed";
-    return CreateBackendErrorResponse("500", "Socket bind failed");
-  }
-  if (!event_loop_->RegisterSocket(fd_wrapper.fd(), kSocketEventReadable,
-                                   this)) {
-    QUIC_DLOG(ERROR) << "Failed to register socket with the event loop";
-    return CreateBackendErrorResponse("500", "Registering socket failed");
-  }
+  absl::flat_hash_map<int, QuicUdpSocketFd> configured_fds;
 
   QuicSpdyStream* stream =
       static_cast<QuicSpdyStream*>(GetActiveStream(request_handler->stream_id()));
@@ -603,11 +639,55 @@ std::unique_ptr<QuicBackendResponse> MasqueServerSession::HandleMasqueRequest(
         << request_handler->stream_id();
     return CreateBackendErrorResponse("500", "Bad stream type");
   }
-  connect_udp_server_states_.push_back(ConnectUdpServerState(
-      stream, target_server_address, fd_wrapper.extract_fd(), this));
+
+  for (auto version : ip_versions) {
+    FdWrapper fd_wrapper(version == 4 ? AF_INET : AF_INET6);
+    if (fd_wrapper.fd() == kQuicInvalidSocketFd) {
+      QUIC_DLOG(ERROR) << "Socket creation failed";
+      return CreateBackendErrorResponse("500", "Socket creation failed");
+    }
+    QuicSocketAddress empty_address(
+        (version == 4 ? QuicIpAddress::Any4() : QuicIpAddress::Any6()), 0);
+    QuicUdpSocketApi socket_api;
+    if (!socket_api.Bind(fd_wrapper.fd(), empty_address)) {
+      QUIC_DLOG(ERROR) << "Socket bind failed";
+      continue;
+      // return CreateBackendErrorResponse("500", "Socket bind failed");
+    }
+    if (!event_loop_->RegisterSocket(fd_wrapper.fd(), kSocketEventReadable,
+                                     this)) {
+      QUIC_DLOG(ERROR) << "Failed to register socket with the event loop";
+      continue;
+      // return CreateBackendErrorResponse("500", "Registering socket failed");
+    }
+    configured_fds[version] = fd_wrapper.extract_fd();
+    QuicSocketAddress configured_address;
+    configured_address.FromSocket(configured_fds[version]);
+    QUIC_DLOG(INFO) << "Socket created, listening at port "
+                    << configured_address.port();
+    configured_addresses.push_back(configured_address.ToString());
+    ;
+  }
+  if (configured_fds.empty()) {
+    QUIC_DLOG(ERROR) << "No sockets could be opened for this request";
+    return CreateBackendErrorResponse("500", "Socket creation/open failed");
+  }
+
+  if (has_bind_header) {
+    // Create bind specific State
+    connect_udp_server_states_.push_back(ConnectUdpServerState(
+        stream, target_server_address, configured_fds, this));
+  } else {
+    connect_udp_server_states_.push_back(ConnectUdpServerState(
+        stream, target_server_address, configured_fds.begin()->second, this));
+  }
 
   quiche::HttpHeaderBlock response_headers;
   response_headers[":status"] = "200";
+  if (has_bind_header) {
+    response_headers["proxy-public-address"] = absl::StrJoin(
+        configured_addresses.begin(), configured_addresses.end(), ",");
+  }
   auto response = std::make_unique<QuicBackendResponse>();
   response->set_response_type(QuicBackendResponse::INCOMPLETE_RESPONSE);
   response->set_headers(std::move(response_headers));
@@ -644,15 +724,26 @@ void MasqueServerSession::OnSocketEvent(QuicEventLoop* /*event_loop*/,
 
 bool MasqueServerSession::HandleConnectUdpSocketEvent(
     QuicUdpSocketFd fd, QuicSocketEventMask events) {
+  bool is_bind = false;
   auto it = absl::c_find_if(connect_udp_server_states_,
-                            [fd](const ConnectUdpServerState& connect_udp) {
-                              return connect_udp.fd() == fd;
+                            [fd, &is_bind](ConnectUdpServerState& connect_udp) {
+                              if (connect_udp.fd() == fd) {
+                                return true;
+                              }
+                              for (auto fd_pair : connect_udp.bind_fds()) {
+                                if (fd_pair.second == fd) {
+                                  is_bind = true;
+                                  return true;
+                                }
+                              }
+                              return false;
                             });
   if (it == connect_udp_server_states_.end()) {
     return false;
   }
   QuicSocketAddress expected_target_server_address =
       it->target_server_address();
+
   QUICHE_DCHECK(expected_target_server_address.IsInitialized());
   QUIC_DVLOG(1) << "Received readable event on fd " << fd << " (mask " << events
                 << ") stream ID " << it->stream()->id() << " server "
@@ -660,16 +751,39 @@ bool MasqueServerSession::HandleConnectUdpSocketEvent(
   QuicUdpSocketApi socket_api;
   QuicUdpPacketInfoBitMask packet_info_interested(
       {QuicUdpPacketInfoBit::PEER_ADDRESS});
-  char packet_buffer[1 + kMaxIncomingPacketSize];
-  packet_buffer[0] = 0;  // context ID.
+
+  size_t max_datagram_header_size = 1;
+  size_t ip_header_size = 0;
+  if (is_bind) {
+    max_datagram_header_size =
+        sizeof(uint64_t) + sizeof(uint8_t) +
+        sizeof(uint16_t) +  // max size of context id, ip version and port
+        quiche::QuicheIpAddress::kIPv6AddressSize;  // ipv6
+    ip_header_size =
+        max_datagram_header_size - sizeof(uint64_t);  // size without context
+  }
+
+  const size_t packet_buffer_size =
+      max_datagram_header_size + kMaxIncomingPacketSize;
+  std::string buffer_str;
+  buffer_str.resize(packet_buffer_size);
+  char* packet_buffer;
+  packet_buffer = buffer_str.data();
+  if (!is_bind) {
+    packet_buffer[0] = 0;  // context ID.
+  }
+
   char control_buffer[kDefaultUdpPacketControlBufferSize];
   while (true) {
     QuicUdpSocketApi::ReadPacketResult read_result;
-    read_result.packet_buffer = {packet_buffer + 1, sizeof(packet_buffer) - 1};
+    // read, leaving space for context, ip version info etc
+    read_result.packet_buffer = {packet_buffer + max_datagram_header_size,
+                                 packet_buffer_size - max_datagram_header_size};
     read_result.control_buffer = {control_buffer, sizeof(control_buffer)};
     socket_api.ReadPacket(fd, packet_info_interested, &read_result);
     if (!read_result.ok) {
       // Most likely there is nothing left to read, break out of read loop.
+      QUIC_DLOG(ERROR) << "Read packet failed";
       break;
     }
     if (!read_result.packet_info.HasValue(QuicUdpPacketInfoBit::PEER_ADDRESS)) {
@@ -677,11 +791,36 @@ bool MasqueServerSession::HandleConnectUdpSocketEvent(
           << "Missing peer address when reading from fd " << fd;
       continue;
     }
-    if (read_result.packet_info.peer_address() !=
-        expected_target_server_address) {
+    QuicSocketAddress peer_address = read_result.packet_info.peer_address();
+
+    uint64_t bind_context_id = UINT64_MAX;
+    bool use_open_context = false;
+    if (is_bind) {
+      uint64_t open_context = UINT64_MAX;
+      uint64_t matching_context = UINT64_MAX;
+      // now check if we either have a matching context or an open context
+      // TODO(abhisinghx) : make this search more efficient
+      for (auto& context_address_pair : it->getBindContextIpMap()) {
+        if (context_address_pair.second == peer_address) {
+          matching_context = context_address_pair.first;
+          break;
+        } else if (context_address_pair.second ==
+                   quiche::CompressionAssignCapsule::kNilAddress) {
+          open_context = context_address_pair.first;
+        }
+      }
+
+      if (matching_context != UINT64_MAX) {
+        bind_context_id = matching_context;
+      } else {
+        use_open_context = true;
+        bind_context_id = open_context;
+      }
+    }
+    if (bind_context_id == UINT64_MAX &&
+        peer_address != expected_target_server_address) {
       QUIC_DLOG(ERROR) << "Ignoring UDP packet on fd " << fd
-                       << " from unexpected server address "
-                       << read_result.packet_info.peer_address()
+                       << " from unexpected server address " << peer_address
                        << " (expected " << expected_target_server_address
                        << ")";
       continue;
@@ -693,15 +832,45 @@ bool MasqueServerSession::HandleConnectUdpSocketEvent(
           << " because MASQUE connection is closed";
       return true;
     }
+
+    size_t final_header_length;
+    char* udp_payload_read_pos = read_result.packet_buffer.buffer;
+    if (!is_bind) {
+      final_header_length = 1;  // only context id
+    } else {
+      ip_header_size =
+          sizeof(uint8_t) +
+          sizeof(uint16_t) +  // max size of context id, ip version and port
+          (peer_address.host().IsIPv4()
+               ? quiche::QuicheIpAddress::kIPv4AddressSize
+               : quiche::QuicheIpAddress::kIPv6AddressSize);  // ip
+      ip_header_size = use_open_context ? ip_header_size : 0;
+      auto context_len = QuicDataWriter::GetVarInt62Len(bind_context_id);
+      final_header_length = ip_header_size + context_len;
+
+      // now write the actual header
+      QuicDataWriter writer(final_header_length,
+                            udp_payload_read_pos - final_header_length);
+      writer.WriteVarInt62(bind_context_id);
+      if (use_open_context) {
+        writer.WriteUInt8(
+            peer_address.host().AddressFamilyToInt() == AF_INET ? 4 : 6);
+        writer.WriteStringPiece(peer_address.host().ToPackedString());
+        writer.WriteUInt16(peer_address.port());
+      }
+    }
+
     // The packet is valid, send it to the client in a DATAGRAM frame.
-    MessageStatus message_status =
-        it->stream()->SendHttp3Datagram(absl::string_view(
-            packet_buffer, read_result.packet_buffer.buffer_len + 1));
-    QUIC_DVLOG(1) << "Sent UDP packet from " << expected_target_server_address
-                  << " of length " << read_result.packet_buffer.buffer_len
-                  << " with stream ID " << it->stream()->id()
-                  << " and got message status "
-                  << MessageStatusToString(message_status);
+    auto message = absl::string_view(
+        udp_payload_read_pos - final_header_length,
+        read_result.packet_buffer.buffer_len + final_header_length);
+    MessageStatus message_status = it->stream()->SendHttp3Datagram(message);
+    QUIC_LOG(INFO) << "Sent UDP packet from " << expected_target_server_address
+                   << " of length " << read_result.packet_buffer.buffer_len
+                   << " with stream ID " << it->stream()->id()
+                   << " and got message status "
+                   << MessageStatusToString(message_status)
+                   << "message size with header: " << message.size();
   }
   return true;
 }
@@ -787,15 +956,44 @@ MasqueServerSession::ConnectUdpServerState::ConnectUdpServerState(
   QUICHE_DCHECK_NE(masque_session_, nullptr);
   this->stream()->RegisterHttp3DatagramVisitor(this);
 }
+// bind state constructor
+MasqueServerSession::ConnectUdpServerState::ConnectUdpServerState(
+    QuicSpdyStream* stream, const QuicSocketAddress& target_server_address,
+    absl::flat_hash_map<int, QuicUdpSocketFd> bind_fds,
+    MasqueServerSession* masque_session)
+    : stream_(stream),
+      target_server_address_(target_server_address),
+      fd_(0),
+      masque_session_(masque_session),
+      bind_fds_(bind_fds) {
+  QUICHE_DCHECK_NE(fd_, kQuicInvalidSocketFd);
+  QUICHE_DCHECK_NE(masque_session_, nullptr);
+  this->stream()->RegisterHttp3DatagramVisitor(this);
+  this->stream()->RegisterConnectUdpBindVisitor(this);
+}
 
 MasqueServerSession::ConnectUdpServerState::~ConnectUdpServerState() {
   if (stream() != nullptr) {
     stream()->UnregisterHttp3DatagramVisitor();
+    if (!bind_fds_.empty()) {
+      stream()->UnregisterConnectUdpBindVisitor();
+    }
   }
+  QuicUdpSocketApi socket_api;
+  for (auto& fd_pair : bind_fds_) {
+    auto fd = fd_pair.second;
+    if (fd == kQuicInvalidSocketFd) {
+      continue;
+    }
+    if (!masque_session_->event_loop()->UnregisterSocket(fd)) {
+      QUIC_DLOG(ERROR) << "Failed to unregister FD " << fd;
+    }
+    socket_api.Destroy(fd);
+  }
+
   if (fd_ == kQuicInvalidSocketFd) {
     return;
   }
-  QuicUdpSocketApi socket_api;
   QUIC_DLOG(INFO) << "Closing fd " << fd_;
   if (!masque_session_->event_loop()->UnregisterSocket(fd_)) {
     QUIC_DLOG(ERROR) << "Failed to unregister FD " << fd_;
@@ -806,6 +1004,9 @@ MasqueServerSession::ConnectUdpServerState::~ConnectUdpServerState() {
 MasqueServerSession::ConnectUdpServerState::ConnectUdpServerState(
     MasqueServerSession::ConnectUdpServerState&& other) {
   fd_ = kQuicInvalidSocketFd;
+  if (!bind_fds_.empty()) {
+    bind_fds_.clear();
+  }
   *this = std::move(other);
 }
 
@@ -826,8 +1027,13 @@ MasqueServerSession::ConnectUdpServerState::operator=(
   fd_ = other.fd_;
   masque_session_ = other.masque_session_;
   other.fd_ = kQuicInvalidSocketFd;
+  bind_fds_ = std::move(other.bind_fds_);
+  other.bind_fds_.clear();
   if (stream() != nullptr) {
     stream()->ReplaceHttp3DatagramVisitor(this);
+    if (!bind_fds_.empty()) {
+      stream()->ReplaceConnectUdpBindVisitor(this);
+    }
   }
   return *this;
 }
@@ -841,19 +1047,102 @@ void MasqueServerSession::ConnectUdpServerState::OnHttp3Datagram(
     QUIC_DLOG(ERROR) << "Failed to read context ID";
     return;
   }
-  if (context_id != 0) {
+  bool is_bind = !bind_fds_.empty();
+  if (!is_bind && context_id != 0) {
     QUIC_DLOG(ERROR) << "Ignoring HTTP Datagram with unexpected context ID "
                      << context_id;
     return;
+  } else if (is_bind && bind_context_ip_map_.find(context_id) ==
+                            bind_context_ip_map_.end()) {
+    QUIC_DLOG(ERROR) << "Context ID " << context_id << " from Dgram not found";
+    return;
   }
+  QuicSocketAddress target_address;
+  if (!is_bind) {
+    target_address = target_server_address_;
+  } else {
+    QUIC_DLOG(INFO) << "CONNECT-UDP-BIND datagram from client";
+    // CONNECT-UDP-BIND
+    // use context id to determine target
+    target_address = bind_context_ip_map_[context_id];
+    if (target_address == quiche::CompressionAssignCapsule::kNilAddress) {
+      // parse IP and port
+      uint8_t ip_version;
+      if (!reader.ReadUInt8(&ip_version)) {
+        QUIC_DLOG(ERROR) << "Failed to read IP version";
+        return;
+      }
+      auto address_size = ip_version == 4
+                              ? quiche::QuicheIpAddress::kIPv4AddressSize
+                              : quiche::QuicheIpAddress::kIPv6AddressSize;
+      absl::string_view ip_address_bytes;
+      if (!reader.ReadStringPiece(&ip_address_bytes, address_size)) {
+        QUIC_DLOG(ERROR) << "Failed to read IP address";
+        return;
+      }
+      quiche::QuicheIpAddress ip_address;
+      if (!ip_address.FromPackedString(ip_address_bytes.data(),
+                                       ip_address_bytes.size())) {
+        QUIC_DLOG(ERROR) << "Failed to parse IP address";
+        return;
+      }
+      uint16_t port;
+      if (!reader.ReadUInt16(&port)) {
+        QUIC_DLOG(ERROR) << "Failed to read port";
+        return;
+      }
+      target_address = QuicSocketAddress(ip_address, port);
+    }
+  }
+
   absl::string_view http_payload = reader.ReadRemainingPayload();
   QuicUdpSocketApi socket_api;
   QuicUdpPacketInfo packet_info;
-  packet_info.SetPeerAddress(target_server_address_);
+  packet_info.SetPeerAddress(target_address);
+  // todo validation
+  int fd =
+      is_bind
+          ? bind_fds_[target_address.host().AddressFamilyToInt() == AF_INET ? 4
+                                                                            : 6]
+          : fd_;
   WriteResult write_result = socket_api.WritePacket(
-      fd_, http_payload.data(), http_payload.length(), packet_info);
-  QUIC_DVLOG(1) << "Wrote packet of length " << http_payload.length() << " to "
-                << target_server_address_ << " with result " << write_result;
+      fd, http_payload.data(), http_payload.length(), packet_info);
+  QUIC_DLOG(INFO) << "Wrote packet of length " << http_payload.length()
+                  << " to " << target_address << " with result " << write_result
+                  << "payload:" << http_payload;
+}
+
+bool MasqueServerSession::ConnectUdpServerState::OnCompressionAssignCapsule(
+    const quiche::CompressionAssignCapsule& capsule) {
+  bind_context_ip_map_[capsule.context_id] = capsule.ip_address_port;
+  // send acknowledgement
+
+  Capsule compression_assign_capsule = Capsule::CompressionAssign();
+  compression_assign_capsule.compression_assign_capsule().context_id =
+      capsule.context_id;
+  compression_assign_capsule.compression_assign_capsule().ip_address_port =
+      capsule.ip_address_port;
+  stream()->WriteCapsule(compression_assign_capsule);
+  // Right now server doesn't do any of its own compression
+  // so validation to prevent echos isnt necessary
+  // TODO(abhisinghx) : Compression Request Strategy for Server
+  return true;
+}
+bool MasqueServerSession::ConnectUdpServerState::OnCompressionCloseCapsule(
+    const quiche::CompressionCloseCapsule& capsule) {
+  if (bind_context_ip_map_.contains(capsule.context_id)) {
+    bind_context_ip_map_.erase(capsule.context_id);
+  }
+  // send acknowledgement
+  Capsule compression_close_capsule = Capsule::CompressionClose();
+  compression_close_capsule.compression_close_capsule().context_id =
+      capsule.context_id;
+  stream()->WriteCapsule(compression_close_capsule);
+  // Right now server doesn't do any of its own memory management
+  // and doesn't ever do a close
+  // so validation of closes to prevent echos isnt necessary
+  // TODO(abhisinghx) : Compression Close Strategy for Server
+  return true;
 }
 
 MasqueServerSession::ConnectIpServerState::ConnectIpServerState(

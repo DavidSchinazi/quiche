@@ -70,6 +70,17 @@ class QUIC_NO_EXPORT MasqueEncapsulatedClientSession
       QuicErrorCode error, const std::string& details,
       ConnectionCloseBehavior connection_close_behavior) override;
 
+  // bind specific callbacks
+  bool OnCompressionAssignCapsule(
+      const quiche::CompressionAssignCapsule& /*capsule*/) override {
+    return true;
+  }
+
+  bool OnCompressionCloseCapsule(
+      const quiche::CompressionCloseCapsule& /*capsule*/) override {
+    return true;
+  }
+
   // From MasqueClientSession::EncapsulatedIpSession.
   void ProcessIpPacket(absl::string_view packet) override;
   void CloseIpSession(const std::string& details) override;

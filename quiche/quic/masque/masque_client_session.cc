@@ -96,21 +96,39 @@ const MasqueClientSession::ConnectUdpClientState*
 MasqueClientSession::GetOrCreateConnectUdpClientState(
     const QuicSocketAddress& target_server_address,
     EncapsulatedClientSession* encapsulated_client_session) {
-  for (const ConnectUdpClientState& client_state : connect_udp_client_states_) {
-    if (client_state.target_server_address() == target_server_address &&
-        client_state.encapsulated_client_session() ==
-            encapsulated_client_session) {
-      // Found existing CONNECT-UDP request.
-      return &client_state;
+  QUIC_DLOG(INFO) << "GetOrCreateConnectUdpClientState";
+  if (isBind() && bind_state_ != nullptr) {
+    QUIC_DLOG(INFO) << "Found bind state";
+    return bind_state_.get();
+  }
+  if (!isBind()) {
+    QUIC_DLOG(INFO) << "Returning existing non bind state";
+    for (const ConnectUdpClientState& client_state :
+         connect_udp_client_states_) {
+      if (client_state.target_server_address() == target_server_address &&
+          client_state.encapsulated_client_session() ==
+              encapsulated_client_session) {
+        // Found existing CONNECT-UDP request.
+        return &client_state;
+      }
     }
   }
+  QUIC_DLOG(INFO) << "No existing state non bind state found, create one";
   // No CONNECT-UDP request found, create a new one.
-  std::string target_host;
-  auto it = fake_addresses_.find(target_server_address.host().ToPackedString());
-  if (it != fake_addresses_.end()) {
-    target_host = it->second;
+  std::string target_host, target_port;
+
+  if (isBind()) {
+    target_host = "*";
+    target_port = "*";
   } else {
-    target_host = target_server_address.host().ToString();
+    auto it =
+        fake_addresses_.find(target_server_address.host().ToPackedString());
+    if (it != fake_addresses_.end()) {
+      target_host = it->second;
+    } else {
+      target_host = target_server_address.host().ToString();
+    }
+    target_port = absl::StrCat(target_server_address.port());
   }
 
   url::Parsed parsed_uri_template;
@@ -131,7 +149,7 @@ MasqueClientSession::GetOrCreateConnectUdpClientState(
   }
   absl::flat_hash_map<std::string, std::string> parameters;
   parameters["target_host"] = target_host;
-  parameters["target_port"] = absl::StrCat(target_server_address.port());
+  parameters["target_port"] = target_port;
   std::string expanded_path;
   absl::flat_hash_set<std::string> vars_found;
   bool expanded =
@@ -183,6 +201,11 @@ MasqueClientSession::GetOrCreateConnectUdpClientState(
   headers[":scheme"] = scheme;
   headers[":authority"] = authority;
   headers[":path"] = canonicalized_path;
+  if (isBind()) {
+    headers["connect-udp-bind"] = "?1";
+    // headers["capsule-protocol"] = "?1";
+    // TODO(abhisinghx): Is this necessary?
+  }
   AddAdditionalHeaders(headers, url);
   QUIC_DVLOG(1) << "Sending request headers: " << headers.DebugString();
   size_t bytes_sent =
@@ -192,9 +215,17 @@ MasqueClientSession::GetOrCreateConnectUdpClientState(
     return nullptr;
   }
 
-  connect_udp_client_states_.push_back(ConnectUdpClientState(
-      stream, encapsulated_client_session, this, target_server_address));
-  return &connect_udp_client_states_.back();
+  if (!isBind()) {
+    connect_udp_client_states_.push_back(ConnectUdpClientState(
+        stream, encapsulated_client_session, this, target_server_address));
+    return &connect_udp_client_states_.back();
+  } else {
+    QUIC_DLOG(INFO) << "Creating bind state";
+    bind_state_ = std::make_unique<ConnectUdpClientState>(
+        stream, encapsulated_client_session, this, target_server_address);
+    bind_state_->setIsBind(true);
+    return bind_state_.get();
+  }
 }
 
 const MasqueClientSession::ConnectIpClientState*
@@ -369,6 +400,12 @@ void MasqueClientSession::SendPacket(
     QUIC_DLOG(ERROR) << "Failed to create CONNECT-UDP request";
     return;
   }
+  if (masque_mode_ == MasqueMode::kConnectUdpBind) {
+    QUIC_LOG(INFO) << "Sending bind packet to stream "
+                   << connect_udp->stream()->id();
+    SendHttp3Datagram(connect_udp->stream()->id(), packet);
+    return;
+  }
 
   std::string http_payload;
   http_payload.resize(1 + packet.size());
@@ -520,11 +557,13 @@ MasqueClientSession::ConnectUdpClientState::ConnectUdpClientState(
       target_server_address_(target_server_address) {
   QUICHE_DCHECK_NE(masque_session_, nullptr);
   this->stream()->RegisterHttp3DatagramVisitor(this);
+  this->stream()->RegisterConnectUdpBindVisitor(this);
 }
 
 MasqueClientSession::ConnectUdpClientState::~ConnectUdpClientState() {
   if (stream() != nullptr) {
     stream()->UnregisterHttp3DatagramVisitor();
+    this->stream()->UnregisterConnectUdpBindVisitor();
   }
 }
 
@@ -551,15 +590,17 @@ void MasqueClientSession::ConnectUdpClientState::OnHttp3Datagram(
     QuicStreamId stream_id, absl::string_view payload) {
   QUICHE_DCHECK_EQ(stream_id, stream()->id());
   QuicDataReader reader(payload);
-  uint64_t context_id;
-  if (!reader.ReadVarInt62(&context_id)) {
-    QUIC_DLOG(ERROR) << "Failed to read context ID";
-    return;
-  }
-  if (context_id != 0) {
-    QUIC_DLOG(ERROR) << "Ignoring HTTP Datagram with unexpected context ID "
-                     << context_id;
-    return;
+  if (!is_bind_) {
+    uint64_t context_id;
+    if (!reader.ReadVarInt62(&context_id)) {
+      QUIC_DLOG(ERROR) << "Failed to read context ID";
+      return;
+    }
+    if (context_id != 0) {
+      QUIC_DLOG(ERROR) << "Ignoring HTTP Datagram with unexpected context ID "
+                       << context_id;
+      return;
+    }
   }
   absl::string_view http_payload = reader.ReadRemainingPayload();
   encapsulated_client_session_->ProcessPacket(http_payload,

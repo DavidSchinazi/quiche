@@ -604,8 +604,10 @@ class MasqueTcpServer : public QuicSocketEventListener,
     } else if (auto key_proxy_pair = key_proxy_urls_.find(path);
                key_proxy_pair != key_proxy_urls_.end() &&
                method_pair->second == "GET" &&
-              //  accept_pair != headers.end() &&
-              //  accept_pair->second == "application/ohttp-keys" &&
+#ifdef QUICHE_REQUIRE_ACCEPT_HEADER_FOR_OHTTP_KEY_PROXY
+               accept_pair != headers.end() &&
+               accept_pair->second == "application/ohttp-keys" &&
+#endif
                body.empty()) {
       absl::Status status = HandleOhttpKeyProxyRequest(connection, stream_id,
                                                        key_proxy_pair->second);

@@ -77,6 +77,7 @@ void MasqueH2Connection::StartH2() {
       Http2Setting{Http2KnownSettingsId::MAX_HEADER_LIST_SIZE, 65535});
   h2_adapter_ = http2::adapter::OgHttp2Adapter::Create(*this, options);
   h2_adapter_->SubmitSettings(settings);
+  // Increase connection-level flow control window to 256MB.
   h2_adapter_->SubmitWindowUpdate(0, 268435456);
   visitor_->OnConnectionReady(this);
 }

@@ -603,8 +603,9 @@ class MasqueTcpServer : public QuicSocketEventListener,
       response_body = masque_ohttp_gateway_->concatenated_keys();
     } else if (auto key_proxy_pair = key_proxy_urls_.find(path);
                key_proxy_pair != key_proxy_urls_.end() &&
-               method_pair->second == "GET" && accept_pair != headers.end() &&
-               accept_pair->second == "application/ohttp-keys" &&
+               method_pair->second == "GET" &&
+              //  accept_pair != headers.end() &&
+              //  accept_pair->second == "application/ohttp-keys" &&
                body.empty()) {
       absl::Status status = HandleOhttpKeyProxyRequest(connection, stream_id,
                                                        key_proxy_pair->second);
